@@ -27,7 +27,12 @@ const startGame = async (_gameId) => {
     // startGameTx.chainId = process.env.CHAIN_ID;
     // const tx = await privSigner.sendTransaction(startGameTx);
     // const receipt = await tx.wait();
-    startedGames.push(_gameId);
+    if (createdGames.find((item)=> item === _gameId)) {
+      createdGames.pop(_gameId);
+    }
+    if (!startedGames.find((item)=> item === _gameId)) {
+      startedGames.push(_gameId);
+    }
     console.log(`[✅] Game ${_gameId} started. → txn: ${receipt.hash}`);
   } catch (err) {
     console.error(`[❌] startGame-Err:`, err);
@@ -157,6 +162,7 @@ const revealNum = async (gameId, retry = 0) => {
   // Scan Cycle
   setInterval(async () => {
     const latestGameId = Number(await contract.gameCounter());
+    //catch new game
     for (lastLatestGameId; lastLatestGameId < latestGameId; ++lastLatestGameId) {
       const status = Number(await contract.gameStatus(lastLatestGameId));
       switch (status) {
