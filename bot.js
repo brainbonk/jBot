@@ -182,6 +182,7 @@ const revealNum = async (gameId, retry = 0) => {
     if (startedGames.length > 0) {
       startedGames.forEach(async (_gameId) => {
         console.log("revealNum cycle", _gameId);
+        await revealNum(_gameId, 0);
         
         // const success = await revealNum(_gameId, 0);
         // if (!success) {
@@ -193,3 +194,28 @@ const revealNum = async (gameId, retry = 0) => {
     }
   }, REVEAL_INTERVAL_MS);
 })();
+
+/**
+ * function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+(async function revealNumCycle() {
+  while (true) {
+    console.log("--> revealNum Cycle", createdGames, startedGames);
+    if (startedGames.length > 0) {
+      for (const _gameId of startedGames) {
+        console.log("revealNum cycle", _gameId);
+        await revealNum(_gameId, 0);
+      }
+    }
+    await sleep(REVEAL_INTERVAL_MS);
+  }
+})();
+ * fonksiyonunda, forEach ile yapılan await işlemleri paralel çalışır ve interval süresi dolduğunda bir önceki döngü bitmemiş olsa bile yeni bir döngü başlatılır.
+Eğer her revealNum çağrısının bitmesini ve ardından interval süresinin geçmesini istiyorsanız, setInterval yerine kendiniz bir döngü ve await ile bekleme (örneğin setTimeout veya sleep fonksiyonu) kullanmalısınız.
+
+Aşağıda, her döngüde tüm startedGames için sırayla revealNum çağrılır ve her döngü sonunda interval kadar beklenir:
+
+Bu şekilde, bir döngü tamamlanmadan yenisi başlamaz ve her döngü arasında tam olarak REVEAL_INTERVAL_MS kadar beklenir.
+ */
