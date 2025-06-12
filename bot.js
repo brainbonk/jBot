@@ -1,45 +1,122 @@
 require("dotenv").config();
-const { JsonRpcProvider, Contract, Wallet, ZeroAddress } = require("ethers");
+const { JsonRpcProvider, Contract, Wallet, Interface, ZeroAddress } = require("ethers");
 const { abi } = require("./abi.json");
+const iface = new Interface(abi);
 
-const REVEAL_INTERVAL_MS = 3000;
-const SCAN_INTERVAL_MS = 9000;
+const SCAN_INTERVAL_MS = 15000;
+const REVEAL_INTERVAL_MS = 5000;
+const DELAY_INTERVAL_MS = 10000;
+const startMinPlayers = 1;
+const cancelTimeLimit = 45;
 
-console.log("🎯 Bot Started...");
+console.log("🎯 Jammy Reveal Bot v1.0 STARTED");
 console.log("🔁 Game Scan Interval:", SCAN_INTERVAL_MS / 1000, "sec.");
 console.log("🎲 Reveal Num. Interval:", REVEAL_INTERVAL_MS / 1000, "sec.");
+console.log("⏳ Reveal Delay Interval:", DELAY_INTERVAL_MS / 1000, "sec.");
+console.log("🔴 Cancel time limit:", cancelTimeLimit, "sec.");
+console.log("👤 Minimum players to start a game:", startMinPlayers, "players");
 console.log("===============================\n");
 
-let lastLatestGameId = 0;
+const firstGameId = 200;
+let nextLatestGameId = 0;
+let activeNonce = null;
 let createdGames = [];
 let startedGames = [];
-
-const gameStartTimes = {};
+let gameStartTimes = []; // {gameId: ..., timestamp:...}
+let pendingStartTxs = [];
+let pendingCancelTxs = [];
+let pendingRevealTxs = [];
+let delayedGames = []; // {gameId: ..., timestamp:...}
 
 const jsonRpcProvider = new JsonRpcProvider(process.env.RPC_URL);
 const privSigner = new Wallet(process.env.DEPLOYER_PRIVKEY, jsonRpcProvider);
 const contract = new Contract(process.env.CONTRACT_ADDRESS, abi, privSigner);
 
-const startGame = async (_gameId) => {
+const moveGameId = (gameId, removeIndex, pushItem, fromArray, toArray) => {
+  if (removeIndex === -1) {
+    removeIndex = fromArray.indexOf(gameId);
+  }
+  //remove
+  if (removeIndex > -1) {
+    fromArray.splice(removeIndex, 1); //.splice(item position, count)
+    //add (fromArray olan gameId, toArrayya taşınır. delay olma durumunda böyle olmalı)
+    if (toArray !== null) {
+      const toArrayIndex = toArray.indexOf(gameId);
+      if (toArrayIndex === -1) {
+        toArray.push(pushItem);
+      }
+    }
+  }
+}
+
+const displayTimeDetail = (gameId, gameStartedIndex) => {
+  moveGameId(gameId, gameStartedIndex, null, startedGames, null); // only remove from startedGames
+
+  const gameTimeIndex = gameStartTimes.map(item => item.gameId).indexOf(gameId);
+  if (gameTimeIndex > -1) {
+    const durationMs = Date.now() - gameStartTimes.find((item)=> item.gameId === gameId).timestamp;
+    const minutes = Math.floor(durationMs / 60000);
+    const seconds = Math.floor((durationMs % 60000) / 1000);
+    console.log(
+      `[⏱️] Time Detail → Game ${gameId} over in ${minutes}:${seconds} minutes.`
+    );
+    moveGameId(gameId, gameTimeIndex, null, gameStartTimes, null); // only remove from gameStartTimes
+  }
+}
+
+const startGame = async (gameId) => {
   try {
-    console.log(`[🚀] Game ${_gameId} starting...`);
-    // let startGameTx = await contract.startGame.populateTransaction(gameId);
-    // startGameTx.chainId = process.env.CHAIN_ID;
-    // const tx = await privSigner.sendTransaction(startGameTx);
-    // const receipt = await tx.wait();
-    startedGames.push(_gameId);
-    console.log(`[✅] Game ${_gameId} started. → txn: ${receipt.hash}`);
+    console.log(`[🚀] Game ${gameId} starting...`);
+    moveGameId(gameId, -1, gameId, createdGames, pendingStartTxs);
+
+    let startGameTx = await contract.startGame.populateTransaction(gameId);
+    startGameTx.chainId = process.env.CHAIN_ID;
+    startGameTx.nonce = activeNonce;
+    activeNonce++;
+    const tx = await privSigner.sendTransaction(startGameTx);
+    const receipt = await tx.wait();
+
+    moveGameId(gameId, -1, gameId, pendingStartTxs, startedGames);
+    gameStartTimes.push({ gameId, timestamp: Date.now() });
+    console.log(`[✅] Game ${gameId} started. → txn: ${receipt?.hash}`);
   } catch (err) {
-    console.error(`[❌] startGame-Err:`, err);
+    moveGameId(gameId, -1, gameId, pendingStartTxs, createdGames);
+    console.log(`[❌] ${gameId} startGame-Err: code: ${err.code}, msg: ${err.shortMessage}`);
+    if (err.code === "ETIMEDOUT") {
+      console.log("timeout interval... retry startgame", gameId);
+    }
+  }
+};
+
+const cancelGame = async (gameId) => {
+  try {
+    console.log(`[⚠️] Game ${gameId} has less than ${startMinPlayers} players! For this reason it is cancelled.`);
+    moveGameId(gameId, -1, gameId, createdGames, pendingCancelTxs);
+
+    let cancelGameTx = await contract.cancelGame.populateTransaction(gameId);
+    cancelGameTx.chainId = process.env.CHAIN_ID;
+    cancelGameTx.nonce = activeNonce;
+    activeNonce++;
+    const tx = await privSigner.sendTransaction(cancelGameTx);
+    const receipt = await tx.wait();
+
+    moveGameId(gameId, -1, gameId, pendingCancelTxs, null);
+    console.log(`[✅] Game ${gameId} cancelled. → txn: ${receipt?.hash}`);
+  } catch (err) {
+    moveGameId(gameId, -1, gameId, pendingCancelTxs, createdGames);
+    console.log(`[❌] ${gameId} cancelGame-Err: code: ${err.code}, msg: ${err.shortMessage}`);
+    if (err.code === "ETIMEDOUT") {
+      console.log("timeout interval... retry cancelGame", gameId);
+    }
   }
 };
 
 const initialCheckGames = async () => {
   try {
-    lastLatestGameId = Number(await contract.gameCounter());
-    for (let gameId = 150; gameId <= lastLatestGameId; gameId++) {
+    activeNonce = await privSigner.getNonce();
+    nextLatestGameId = Number(await contract.gameCounter()) + 1;
+    for (let gameId = firstGameId; gameId < nextLatestGameId; gameId++) {
       const status = Number(await contract.gameStatus(gameId));
-
       switch (status) {
         case 1:
           createdGames.push(gameId);
@@ -48,6 +125,7 @@ const initialCheckGames = async () => {
           startGame(gameId);
           break;
         case 3:
+          gameStartTimes.push({ gameId, timestamp: Date.now() });
           startedGames.push(gameId);
           break;
       }
@@ -55,19 +133,41 @@ const initialCheckGames = async () => {
   } catch (err) {
     console.log(`[❌] initialCheckGames Err:`, err);
   }
-  console.log("[✔] initial completed");
+  console.log("[✔] initial check completed");
+};
+
+const checkGamePlayer = async (gameId) => {
+  try {
+    const game = await contract.games(gameId);
+    const startDate = Number(game.startDate);
+    const currentTime = Math.floor(Date.now() / 1000); // Current time in seconds
+    if (startDate - currentTime < cancelTimeLimit) {
+      const playerCount =  Number(game.totalPlayerCount);
+      if (playerCount < startMinPlayers) {
+        cancelGame(gameId);
+      }
+    }
+  } catch (err) {
+    console.error("[❌] checkGamePlayer Err:", err);
+  }
 };
 
 const checkCreatedGames = async () => {
   try {
     createdGames.forEach(async(gameId) => {
+      checkGamePlayer(gameId);
       const status = Number(await contract.gameStatus(gameId));
       switch (status) {
         case 2:
           startGame(gameId);
           break;
         case 3:
+          gameStartTimes.push({ gameId, timestamp: Date.now() });
           startedGames.push(gameId);
+          break;
+        case 6:
+          console.log(`[🔴] Game ${gameId} cancelled.`);
+          moveGameId(gameId, -1, null, createdGames, null); // only remove from createdGames
           break;
       }
     });
@@ -78,30 +178,15 @@ const checkCreatedGames = async () => {
 
 const checkStartedGames = async () => {
   try {
-    startedGames.forEach(async(gameId) => {
+    startedGames.forEach(async(gameId, index) => {
       const status = Number(await contract.gameStatus(gameId));
-      let isEnded = false;
-
       if (status > 3) {
         console.log(
           `[🔵] Game ${gameId} tracking is over. → status: ${
             status === 4 ? "Ended" : status === 5 ? "Expired" : "Cancelled"
           }.`
         );
-        if (gameStartTimes[gameId]) {
-          const durationMs = Date.now() - gameStartTimes[gameId];
-          const minutes = Math.floor(durationMs / 60000);
-          const seconds = Math.floor((durationMs % 60000) / 1000);
-          console.log(
-            `[⏱️] Game ${gameId} completed. → The game over in ${minutes}:${seconds} minutes.`
-          );
-        } else {
-          console.log(
-            `[✅] Game ${gameId} completed.`
-          );
-        }
-        startedGames.pop(gameId)
-        isEnded = true;
+        displayTimeDetail(gameId, index);
       } else {
         const revealedNumCount = Number(
           (await contract.getGameInfo(gameId, ZeroAddress, 0)).numbersLength
@@ -110,15 +195,16 @@ const checkStartedGames = async () => {
           console.log(
             `[⚠] Game ${gameId} → 75 sayı çekildi ve Jammy ödülü alınmadı. Takip bitti.`
           );
-          startedGames.pop(gameId)
-          isEnded = true;
+          displayTimeDetail(gameId, index);
+        } else {
+          if ((75 - revealedNumCount) > 0) {
+            console.log(
+              `[🟡] Game ${gameId} → ${75 - revealedNumCount}/75 revealed.`
+            );
+          } else {
+            console.log(`[🟡] Game ${gameId} → started reveal cycle...`);
+          }
         }
-      }
-
-      if (isEnded === false && status === 3 && !startedGames.find((item)=> item === gameId)) {
-        startedGames.push(gameId);
-        gameStartTimes[gameId] = Date.now();
-        console.log(`[🟡] Game ${gameId} started. Reveal başladı.`);
       }
     });
   } catch (err) {
@@ -126,96 +212,121 @@ const checkStartedGames = async () => {
   }
 };
 
-const revealNum = async (gameId, retry = 0) => {
+const revealNum = async (gameId) => {
   try {
-    // const revealNumTx = await contract.revealNumber.populateTransaction(gameId);
-    // revealNumTx.chainId = 421614;
-    // const tx = await privSigner.sendTransaction(revealNumTx);
-    // const receipt = await tx.wait();
-    const receipt = null;
+    moveGameId(gameId, -1, gameId, startedGames, pendingRevealTxs);
+    const revealNumTx = await contract.revealNumber.populateTransaction(gameId);
+    revealNumTx.chainId = process.env.CHAIN_ID;
+    revealNumTx.nonce = activeNonce;
+    activeNonce++;
+    const tx = await privSigner.sendTransaction(revealNumTx);
+    const receipt = await tx.wait();
     if (receipt) {
-      console.log(`[✔] Game ${gameId}: Sayı çekildi → TX: ${receipt?.hash}`);
       console.log(
-        `[📊] Game ${gameId} → Revealed Num: ${receipt?.logs?.args.revealNum}`
+        `[📊] Game ${gameId} → Revealed Num: ${iface.parseLog(receipt?.logs[0])?.args.revealedNum} → txn: ${receipt?.hash}`
       );
     } else {
       console.log(`[✘] Game ${gameId} → receipt not found!`);
     }
+    moveGameId(gameId, -1, gameId, pendingRevealTxs, startedGames);
     return true;
   } catch (err) {
-    console.log(`[✘] ${gameId} revealNum Err: ${err}`);
-    if (retry < 3) {
-      console.log(`[↻] Game ${gameId} → retry revealNum... (${retry + 1}/3)`);
-      // return await reveal(gameId, retry + 1);
+    moveGameId(gameId, -1, gameId, pendingRevealTxs, startedGames);
+    console.log(`[❌] ${gameId} revealNum-Err: code: ${err.code}, msg: ${err.shortMessage}`);
+    if (err.code === "ETIMEDOUT") {
+      console.log("timeout interval... retry revealNum", gameId);
     }
     return false;
   }
 };
 
+const checkDelayGames = () => {
+  try {
+    if (delayedGames.length > 0) {
+      const currentTime = Date.now();
+      delayedGames.forEach((item, index) => {
+        const elapsedTime = currentTime - item.timestamp;
+        if (elapsedTime >= DELAY_INTERVAL_MS) {
+          console.log(`### >>> Reveal Delay Finished: Game ${item.gameId} is ready to reveal.`);
+          moveGameId(item.gameId, index, item.gameId, delayedGames, startedGames);
+        }
+      });
+    }
+  } catch (err) {
+    console.error("[❌] checkDelayGames Err:", err);
+  }
+};
+
 (async () => {
+  // --- Event Listeners
+  const listenerPrizeWon = (gameId, PrizeIndex, winner, winnerCard, event) => {
+    // console.log("### >>> PrizeWon Emitted:", gameId, PrizeIndex, winner);
+    console.log(`### >>> Reveal Delayed: Game ${Number(gameId)}`);
+    const indexInStarted = startedGames.indexOf(Number(gameId));
+    if (indexInStarted > -1) {
+      moveGameId(Number(gameId), indexInStarted, { gameId: Number(gameId), timestamp: Date.now() }, startedGames, delayedGames);
+      return;
+    }
+
+    const indexInPending = pendingRevealTxs.indexOf(Number(gameId));
+    if (indexInPending > -1) {
+      moveGameId(Number(gameId), indexInPending, { gameId: Number(gameId), timestamp: Date.now() }, pendingRevealTxs, delayedGames);
+      return;
+    }
+  };
+  contract.on("PrizeWon", listenerPrizeWon);
+  // --- Event Listeners
+
   await initialCheckGames();
   // Scan Cycle
   setInterval(async () => {
-    const latestGameId = Number(await contract.gameCounter());
-    for (lastLatestGameId; lastLatestGameId < latestGameId; ++lastLatestGameId) {
-      const status = Number(await contract.gameStatus(lastLatestGameId));
-      switch (status) {
-        case 1:
-          console.log(`[🚀] Game ${lastLatestGameId} created.`);
-          createdGames.push(lastLatestGameId);
-          break;
-        case 2:
-          startGame(lastLatestGameId);
-          break;
-        case 3:
-          startedGames.push(lastLatestGameId);
-          break;
+    try {
+      console.log(`---> Scan Cycle >>> nextLatestGameId: ${nextLatestGameId}, createdGames: ${JSON.stringify(createdGames)}, startedGames: ${JSON.stringify(startedGames)}`);
+      const latestGameId = Number(await contract.gameCounter());
+      activeNonce = await privSigner.getNonce();
+
+      //catch new game (nextLatestGameId yeni oyun geldikçe ileri taşınır)
+      for (nextLatestGameId; nextLatestGameId <= latestGameId; nextLatestGameId++) {
+        const status = Number(await contract.gameStatus(nextLatestGameId));
+        switch (status) {
+          case 1:
+            if (!createdGames.find((item)=> item === nextLatestGameId)) {
+              console.log(`[🚀] Game ${nextLatestGameId} created.`);
+              createdGames.push(nextLatestGameId);
+            } else {console.log("else-createdGames.find", nextLatestGameId)}
+            break;
+          case 2:
+            startGame(nextLatestGameId);
+            break;
+          case 3:
+            if (!startedGames.find((item)=> item === nextLatestGameId)) {
+              gameStartTimes.push({ gameId, timestamp: Date.now() });
+              startedGames.push(nextLatestGameId);
+            } else {console.log("else-startedGames.find", nextLatestGameId)}
+            break;
+        }
       }
+      checkCreatedGames();
+      checkStartedGames();
+    } catch (error) {
+      console.error("[❌] Scan Cycle Interval Error:", error);
     }
-    checkCreatedGames();
-    checkStartedGames();
   }, SCAN_INTERVAL_MS);
 
   // Reveal Num. Cycle
   setInterval(async () => {
-    console.log("--> revealNum Cycle", createdGames, startedGames);
-    if (startedGames.length > 0) {
-      startedGames.forEach(async (_gameId) => {
-        console.log("revealNum cycle", _gameId);
-        await revealNum(_gameId, 0);
-        
-        // const success = await revealNum(_gameId, 0);
-        // if (!success) {
-        //   console.log(
-        //     `[✘] Game ${_gameId} → 3 deneme başarısız. Geçici olarak durduruldu.`
-        //   );
-        // }
-      });
+    checkDelayGames();
+    console.log(`-> revealNum Cycle >>> ${JSON.stringify(startedGames)} : ${JSON.stringify(pendingRevealTxs)} : ${JSON.stringify(delayedGames)}`);
+    try {
+      if (startedGames.length > 0) {
+        activeNonce = await privSigner.getNonce();
+        startedGames.forEach(async (gameId) => {
+          console.log("> revealNum game:", gameId);
+          revealNum(gameId);
+        });
+      }
+    } catch (error) {
+      console.error("[❌] Reveal Cycle Interval Error:", error);
     }
   }, REVEAL_INTERVAL_MS);
 })();
-
-/**
- * function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-(async function revealNumCycle() {
-  while (true) {
-    console.log("--> revealNum Cycle", createdGames, startedGames);
-    if (startedGames.length > 0) {
-      for (const _gameId of startedGames) {
-        console.log("revealNum cycle", _gameId);
-        await revealNum(_gameId, 0);
-      }
-    }
-    await sleep(REVEAL_INTERVAL_MS);
-  }
-})();
- * fonksiyonunda, forEach ile yapılan await işlemleri paralel çalışır ve interval süresi dolduğunda bir önceki döngü bitmemiş olsa bile yeni bir döngü başlatılır.
-Eğer her revealNum çağrısının bitmesini ve ardından interval süresinin geçmesini istiyorsanız, setInterval yerine kendiniz bir döngü ve await ile bekleme (örneğin setTimeout veya sleep fonksiyonu) kullanmalısınız.
-
-Aşağıda, her döngüde tüm startedGames için sırayla revealNum çağrılır ve her döngü sonunda interval kadar beklenir:
-
-Bu şekilde, bir döngü tamamlanmadan yenisi başlamaz ve her döngü arasında tam olarak REVEAL_INTERVAL_MS kadar beklenir.
- */
